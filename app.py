@@ -387,7 +387,7 @@ class LocationJobSearchService:
                 search_context={"error": str(e)}
             )
     
-    def _build_location_query(self, request: LocationJobRequest, location_matches: Dict) -> Tuple[str, List]:
+    # def _build_location_query(self, request: LocationJobRequest, location_matches: Dict) -> Tuple[str, List]:
         """Build SQL query for location-based search"""
         
         base_query = """
@@ -463,6 +463,69 @@ class LocationJobSearchService:
         logger.info(f"Query : {base_query}")
         return base_query, params
     
+    def _build_location_query(self, request: LocationJobRequest, location_matches: Dict) -> Tuple[str, List]:
+        """Build SQL query for location-based search"""
+        base_query = """
+            SELECT ncspjobid, title, keywords, description,
+                    organization_name, statename, districtname,
+                    industryname, sectorname, functionalareaname, functionalrolename,
+                    aveexp, avewage, numberofopenings, highestqualification,
+                    gendercode, date
+            FROM vacancies_summary
+        """  # CHANGED: removed trailing 'WHERE' here
+        conditions = []
+        params = []
+        param_index = 1
+        # --- Location conditions ---
+        if location_matches.get("states"):
+            # CHANGED: pass the whole Python list as a single param; cast to text[]
+            conditions.append(f"statename = ANY(${param_index}::text[])")
+            params.append(location_matches["states"])
+            param_index += 1
+        if location_matches.get("districts"):
+            # CHANGED: pass the whole Python list as a single param; cast to text[]
+            conditions.append(f"districtname = ANY(${param_index}::text[])")
+            params.append(location_matches["districts"])
+            param_index += 1
+        # --- Experience filter ---
+        if getattr(request, "experience_range", None):
+            min_exp, max_exp = request.experience_range
+            if min_exp is not None:
+                conditions.append(f"aveexp >= ${param_index}")
+                params.append(min_exp)
+                param_index += 1
+            if max_exp is not None:
+                conditions.append(f"aveexp <= ${param_index}")
+                params.append(max_exp)
+                param_index += 1
+        # --- Salary filter ---
+        if getattr(request, "salary_range", None):
+            min_salary, max_salary = request.salary_range
+            if min_salary is not None:
+                conditions.append(f"avewage >= ${param_index}")
+                params.append(min_salary)
+                param_index += 1
+            if max_salary is not None:
+                conditions.append(f"avewage <= ${param_index}")
+                params.append(max_salary)
+                param_index += 1
+        # --- Job type (title/keywords/role) ---
+        if getattr(request, "job_type", None):
+            # CHANGED: use three distinct placeholders instead of repeating the same one
+            p1, p2, p3 = param_index, param_index + 1, param_index + 2
+            conditions.append(
+                f"(LOWER(title) LIKE ${p1} OR LOWER(keywords) LIKE ${p2} OR LOWER(functionalrolename) LIKE ${p3})"
+            )
+            jt = f"%{request.job_type.lower()}%"
+            params.extend([jt, jt, jt])
+            param_index += 3
+        # CHANGED: add WHERE only if there are conditions; join with AND
+        if conditions:
+            base_query += " WHERE " + " AND ".join(conditions)
+        base_query += " ORDER BY ncspjobid DESC LIMIT 2000"
+        logger.info(f"Query : {base_query}")
+        return base_query, params
+
     async def _execute_location_query(self, query: str, params: List) -> List[Dict]:
         """Execute the location query and return formatted results"""
         conn = None
