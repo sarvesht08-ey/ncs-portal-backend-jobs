@@ -388,56 +388,82 @@ class LocationJobSearchService:
             )
     
     def _build_location_query(self, request: LocationJobRequest, location_matches: Dict[str, List[str]]) -> Tuple[str, List]:
-        """Build SQL query for location-based search (psycopg2 %s placeholders)."""
+        """Build SQL query for location-based search (asyncpg $1-style placeholders)."""
+
+        # Clean inputs: remove zero-width/NBSP/BOM chars that can sneak in from UI
+        def _clean(s: str) -> str:
+            return (s.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
+                    .replace('\u2060', '').replace('\ufeff', '').replace('\xa0', '').strip())
+
+        states = [_clean(x) for x in (location_matches.get("states") or [])]
+        districts = [_clean(x) for x in (location_matches.get("districts") or [])]
+
         base_query = """
             SELECT ncspjobid, title, keywords, description,
-                    organization_name, statename, districtname,
-                    industryname, sectorname, functionalareaname, functionalrolename,
-                    aveexp, avewage, numberofopenings, highestqualification,
-                    gendercode, date
+                organization_name, statename, districtname,
+                industryname, sectorname, functionalareaname, functionalrolename,
+                aveexp, avewage, numberofopenings, highestqualification,
+                gendercode, date
             FROM vacancies_summary
         """
+
         conditions: List[str] = []
         params: List = []
-        # --- Location filters (lists) ---
-        states = location_matches.get("states") or []
-        if states:  # expects List[str]
-            conditions.append("statename = ANY('Maharashtra')")
-            params.append(states)  # psycopg2 converts Python list -> Postgres text[]
-        districts = location_matches.get("districts") or []
-        if districts:  # expects List[str]
-            conditions.append("districtname = ANY('Mumbai')")
+        idx = 1  # asyncpg uses $1, $2, ...
+
+        # --- Location filters ---
+        if states:
+            conditions.append(f"statename = ANY(${idx}::text[])")
+            params.append(states)
+            idx += 1
+
+        if districts:
+            conditions.append(f"districtname = ANY(${idx}::text[])")
             params.append(districts)
+            idx += 1
+
         # --- Experience filter ---
         if getattr(request, "experience_range", None):
             min_exp, max_exp = request.experience_range
             if min_exp is not None:
-                conditions.append("aveexp >= %s")
+                conditions.append(f"aveexp >= ${idx}")
                 params.append(min_exp)
+                idx += 1
             if max_exp is not None:
-                conditions.append("aveexp <= %s")
+                conditions.append(f"aveexp <= ${idx}")
                 params.append(max_exp)
+                idx += 1
+
         # --- Salary filter ---
         if getattr(request, "salary_range", None):
             min_salary, max_salary = request.salary_range
             if min_salary is not None:
-                conditions.append("avewage >= %s")
+                conditions.append(f"avewage >= ${idx}")
                 params.append(min_salary)
+                idx += 1
             if max_salary is not None:
-                conditions.append("avewage <= %s")
+                conditions.append(f"avewage <= ${idx}")
                 params.append(max_salary)
+                idx += 1
+
         # --- Job type (title/keywords/role) ---
         jt = getattr(request, "job_type", None)
         if jt:
             jt_like = f"%{str(jt).strip().lower()}%"
-            conditions.append("(LOWER(title) LIKE %s OR LOWER(keywords) LIKE %s OR LOWER(functionalrolename) LIKE %s)")
+            p1, p2, p3 = idx, idx + 1, idx + 2
+            conditions.append(
+                f"(LOWER(title) LIKE ${p1} OR LOWER(keywords) LIKE ${p2} OR LOWER(functionalrolename) LIKE ${p3})"
+            )
             params.extend([jt_like, jt_like, jt_like])
-        # Attach WHERE only if we have conditions
+            idx += 3
+
         if conditions:
             base_query += " WHERE " + " AND ".join(conditions)
+
         base_query += " ORDER BY ncspjobid DESC LIMIT 2000"
         logger.info("Query : %s", base_query)
-        return base_query, params  
+        return base_query, params
+ 
     async def _execute_location_query(self, query: str, params: List) -> List[Dict]:
         """Execute the location query and return formatted results"""
         conn = None
