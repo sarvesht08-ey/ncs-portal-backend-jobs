@@ -402,7 +402,7 @@ class LocationJobSearchService:
         # --- Location filters (lists) ---
         states = location_matches.get("states") or []
         if states:  # expects List[str]
-            conditions.append("statename = ANY(Maharashtra)")
+            conditions.append("statename = ANY('Maharashtra')")
             params.append(states)  # psycopg2 converts Python list -> Postgres text[]
         districts = location_matches.get("districts") or []
         if districts:  # expects List[str]
