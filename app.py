@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, validator
 import asyncpg
 from dotenv import load_dotenv
 from openai import AzureOpenAI
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer,util
 import torch
 import numpy as np
 import faiss
@@ -34,6 +34,19 @@ from cv import CVProcessor, CVProfile
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 
+
+#----------------------------------------------------
+from fastapi import FastAPI, File, UploadFile
+from io import BytesIO
+import io
+from docx import Document
+import json
+import pdfplumber
+import pytesseract
+from PIL import Image
+
+#----------------------------------------------------
+
 # Load environment variables
 load_dotenv()
 
@@ -43,6 +56,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+#Adding Resume ini sec 
+#pytesseract.pytesseract.tesseract_cmd = r"C:\Users\WK929BY\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+JSON_FILE_PATH = r"naukriApiResponse.json"
+# Load similarity model once
+model = SentenceTransformer("models/all-MiniLM-L6-v2")
+print(" Model loaded successfully.")
 
 # Global thread pool for CPU-intensive embedding operations
 embedding_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="embedding")
@@ -4165,13 +4186,194 @@ async def chat_with_cv_context(request: ChatWithCVRequest) -> ChatResponse:
             message_type="text",
             chat_phase="job_searching"
         )
+
+#----- Resume fetch info call--------
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    job_matches = []  # initialize here
+
+    content = await file.read()
+    cv_text,table_output= process_uploaded_file(content, file.filename)
+    cv_keywords_text = extract_cv_keywords(cv_text, table_rows=table_output, top_n=30)
+
+    if cv_keywords_text and cv_keywords_text.strip():   #  only if CV text exists
+        # Read job JSON
+        jobs_data = read_json()
+        if jobs_data["status"] == "error":
+            return jobs_data
+
+        job_matches = match_jobs(cv_keywords_text, jobs_data["data"]["content"])
+        print(f" Found {len(job_matches)} job matches for CV: {file.filename}")
+    return {
+        "filename": file.filename,
+        "size": len(content),
+                    "matches": job_matches   #  return matches in response
+
+    }
+
+def process_uploaded_file(file_bytes: bytes, filename: str):
+    text_output = ""
+    table_output = []
+    file_ext = filename.lower().split('.')[-1]
+
+    try:
+        if file_ext in ['png', 'jpg', 'jpeg']:
+            text_output = perform_ocr_on_image(file_bytes)
+
+        elif file_ext == 'pdf':
+            text_output, table_output = extract_text_from_pdf(file_bytes)
+
+            print("PDF file processing is not implemented yet.")
+
+        elif file_ext == 'docx':
+            text_output = extract_text_from_docx(file_bytes)
+
+        else:
+            print("unsupported format")
+
+    except Exception as e:
+        print("Error processing file:", str(e))
+    return text_output ,table_output 
+
+
+def perform_ocr_on_image(image_bytes):
+    img = Image.open(io.BytesIO(image_bytes))
+    text = pytesseract.image_to_string(img)
+    return text.strip()
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+
+    doc = Document(BytesIO(file_bytes))
+    extracted_text = []
+
+    # Extract paragraphs (handles text + bullets/numbers)
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            extracted_text.append(text)
+
+    # Extract tables
+    for table in doc.tables:
+        for row in table.rows:
+            row_data = []
+            for cell in row.cells:
+                cell_text = cell.text.strip()
+                if cell_text:
+                    row_data.append(cell_text)
+            if row_data:
+                extracted_text.append(" | ".join(row_data))
+
+    return "\n".join(extracted_text)
+
+
+def extract_text_from_pdf(file_bytes):
+    text_output = ""
+    table_output = []
+
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        print(f"PDF opened successfully, total pages: {len(pdf.pages)}")
+
+        for i, page in enumerate(pdf.pages):
+            # Extract tables
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    row_data = [cell.strip() for cell in row if cell and cell.strip()]
+                    if row_data:
+                        table_line = " | ".join(row_data)
+                        text_output += f"\n--- Page {i+1} Table ---\n{table_line}"
+                        table_output.append({
+                            "page_number": i + 1,
+                            "row_text": table_line
+                        })
+
+            # Extract text
+            text = page.extract_text()
+            if text:
+                text_output += f"\n--- Page {i+1} ---\n{text.strip()}"
+            else:
+                pil_image = page.to_image(resolution=300).original
+                ocr_text = pytesseract.image_to_string(pil_image)
+                if ocr_text.strip():
+                    text_output += f"\n--- OCR Page {i+1} ---\n{ocr_text.strip()}"
+        print(f"\n Finished PDF processing. Total extracted text length: {len(text_output)} chars")
+        print(f"Total table rows extracted: {len(table_output)}")
+    return text_output, table_output
+
+
+
+def read_json():
+    try:
+        with open(JSON_FILE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {"status": "success", "data": data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+
+def match_jobs(cv_text: str, jobs: list, top_k: int = 100):
+    # Only use skills (and optionally role) for similarity
+    job_texts = []
+    for job in jobs:
+        skills = job.get("key_skills", "") or ""
+        role_text = job.get("role", "") or ""
+
+        #  Search only based on skills (+ optional role if you want)
+        job_doc = f"Skills: {skills}. Role: {role_text}"
+        job_texts.append(job_doc)
+
+    # Encode CV and Jobs
+    cv_embedding = model.encode(cv_text, convert_to_tensor=True)
+    job_embeddings = model.encode(job_texts, convert_to_tensor=True)
+
+    # Similarity search
+    similarities = util.cos_sim(cv_embedding, job_embeddings)[0]
+    top_results = similarities.topk(k=min(top_k, len(job_texts)))
+
+    # Return ALL fields in output, not just skills
+    matches = []
+    for score, idx in zip(top_results.values, top_results.indices):
+        matches.append({
+            **jobs[idx],         #  includes all job fields (title, salary, etc.)
+            "score": float(score)  #  similarity score
+        })
+    return matches
+
+from keybert import KeyBERT
+
+# Load KeyBERT model once
+kw_model = KeyBERT("models/all-MiniLM-L6-v2")
+
+def extract_cv_keywords(cv_text: str, table_rows: list = None, top_n: int = 30) -> str:
+
+    # Combine paragraph text and table rows
+    combined_text = cv_text
+    if table_rows:
+        # combined_text += "\n" + "\n".join(table_rows)
+        combined_text += "\n" + "\n".join(
+    [" ".join(map(str, row)) for row in table_rows]
+)
+
+
+    # Extract top keywords using KeyBERT
+    keywords_with_scores = kw_model.extract_keywords(
+        combined_text,
+        top_n=top_n,
+        stop_words="english"
+    )
+
+    # Convert to a single string
+    keywords_text = " ".join([kw for kw, score in keywords_with_scores])
+
+    return keywords_text
     
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8888))
     host = os.getenv("HOST", "0.0.0.0")
- 
+
     uvicorn.run(
         "app:app",
         host=host,
