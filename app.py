@@ -3704,14 +3704,13 @@ cv_processor = CVProcessor(
 # FastAPI app with lifespan management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Job Search API starting up...")
+    logger.info("=== Job Search API Starting Up ===")
     
-    # Validate env vars
+    # Validate env vars - UPDATED: Remove DATABASE_URL, check DB_CONFIG components
     required_env_vars = [
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT", 
         "AZURE_GPT_DEPLOYMENT",
-        "DATABASE_URL"
     ]
     
     missing_vars = [var for var in required_env_vars if not os.getenv(var)]
@@ -3719,33 +3718,43 @@ async def lifespan(app: FastAPI):
         logger.error(f"Missing env vars: {missing_vars}")
         raise ValueError(f"Missing: {missing_vars}")
     
-    # Initialize DB pool FIRST
-    # try:
-    #     await DatabasePool.initialize(
-    #         os.getenv("DATABASE_URL"),
-    #         min_size=5,
-    #         max_size=20
-    #     )
-    #     logger.info("Database pool initialized")
-    # except Exception as e:
-    #     logger.error(f"Pool init failed: {e}")
-    #     raise
+    logger.info("✓ Azure OpenAI environment variables validated")
+    
+    # Log database connection info
+    logger.info(f"Database config: {DB_CONFIG['user']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+    
+    
+    # Initialize DB pool - UPDATED: No arguments needed, uses DB_CONFIG internally
+    try:
+        await DatabasePool.initialize(
+            min_size=5,
+            max_size=20
+        )
+        logger.info("✓ Database pool initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Pool initialization failed: {e}")
+        raise
     
     # Load FAISS index
     try:
+        logger.info("Loading FAISS job search index...")
         await vector_store.load_jobs_from_db()
-        logger.info("Job search index loaded")
+        logger.info("✓ Job search index loaded successfully")
     except Exception as e:
-        logger.error(f"Index load failed: {e}")
+        logger.error(f"❌ Index load failed: {e}")
         raise
     
-    logger.info("API started successfully")
+    logger.info("=== API Started Successfully ===")
     yield
     
     # Shutdown
-    logger.info("Shutting down...")
-    await DatabasePool.close()
-    embedding_executor.shutdown(wait=True)
+    logger.info("=== API Shutting Down ===")
+    try:
+        await DatabasePool.close()
+        embedding_executor.shutdown(wait=True)
+        logger.info("✓ Shutdown completed successfully")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
 
 
 
