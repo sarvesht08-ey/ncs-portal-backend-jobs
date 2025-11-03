@@ -3741,10 +3741,10 @@ async def get_complete_job_details(
 ) -> List[Dict]:
     """Fetch with SQL-level type conversion"""
     if not job_ids:
-        return []
-    
+        return []    
     try:
         async with DatabasePool.acquire() as conn:
+            print("loc")
             if location:
                 query = """
                     SELECT 
