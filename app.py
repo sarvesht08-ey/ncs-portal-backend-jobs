@@ -45,7 +45,7 @@ import pdfplumber
 import pytesseract
 from PIL import Image
 import re
-
+from database_connection import DB_CONFIG
 
 
 
@@ -62,42 +62,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# app.py - UPDATE DatabasePool class
+
 class DatabasePool:
     _pool: Optional[asyncpg.Pool] = None
     
     @classmethod
-    async def initialize(cls, db_url: str, min_size: int = 5, max_size: int = 20):
-        """Initialize connection pool - call during startup"""
+    async def initialize(cls, min_size: int = 5, max_size: int = 20):
+        """Initialize pool with DB_CONFIG parameters"""
         try:
+            logger.info(f"Connecting to {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+            
+            # Test single connection first
+            test_conn = await asyncpg.connect(**DB_CONFIG)
+            version = await test_conn.fetchval('SELECT version()')
+            logger.info(f"✓ Test connection successful: {version[:50]}")
+            await test_conn.close()
+            
+            # Create pool with DB_CONFIG parameters
             cls._pool = await asyncpg.create_pool(
-                db_url,
+                **DB_CONFIG,
                 min_size=min_size,
                 max_size=max_size,
-                command_timeout=60,
+                max_inactive_connection_lifetime=300,
                 server_settings={
-                    'jit': 'off',  # Azure perf optimization
-                    'search_path': 'public'
+                    'jit': 'off',
+                    'search_path': 'public',
+                    'application_name': 'ncs-job-search'
                 }
             )
-            logger.info(f"Database pool initialized: {min_size}-{max_size} connections")
+            
+            # Verify pool
+            async with cls._pool.acquire() as conn:
+                count = await conn.fetchval('SELECT COUNT(*) FROM vacancies_summary')
+                logger.info(f"✓ Pool initialized - Found {count:,} jobs in database")
+            
         except Exception as e:
-            logger.error(f"Pool initialization failed: {e}")
+            logger.error(f"❌ Pool initialization failed: {type(e).__name__}: {e}")
             raise
     
     @classmethod
     async def close(cls):
-        """Close pool - call during shutdown"""
         if cls._pool:
             await cls._pool.close()
-            logger.info("Database pool closed")
+            logger.info("✓ Database pool closed")
     
     @classmethod
     @asynccontextmanager
     async def acquire(cls):
-        """Context manager for acquiring connection"""
         if not cls._pool:
-            raise RuntimeError("Pool not initialized")
-        
+            raise RuntimeError("Database pool not initialized")
         async with cls._pool.acquire() as conn:
             yield conn
     
@@ -2465,12 +2479,12 @@ class FAISSVectorStore:
                 logger.info("Building new FAISS index from database...")
                 
                 # Connect to database and fetch jobs
-                conn = await asyncpg.connect(DB_URL)
+                await asyncpg.connect(**DB_CONFIG)
                 try:
                     rows = await conn.fetch("""
                         SELECT ncspjobid, title, keywords, description
                         FROM vacancies_summary
-                        WHERE (keywords IS NOT NULL AND keywords != '') 
+                        WHERE (keywords IS NOT NULL AND keywords != '')
                            OR (description IS NOT NULL AND description != '')
                         ORDER BY ncspjobid;
                     """)
@@ -3690,14 +3704,13 @@ cv_processor = CVProcessor(
 # FastAPI app with lifespan management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Job Search API starting up...")
+    logger.info("=== Job Search API Starting Up ===")
     
-    # Validate env vars
+    # Validate env vars - UPDATED: Remove DATABASE_URL, check DB_CONFIG components
     required_env_vars = [
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT", 
         "AZURE_GPT_DEPLOYMENT",
-        "DATABASE_URL"
     ]
     
     missing_vars = [var for var in required_env_vars if not os.getenv(var)]
@@ -3705,83 +3718,126 @@ async def lifespan(app: FastAPI):
         logger.error(f"Missing env vars: {missing_vars}")
         raise ValueError(f"Missing: {missing_vars}")
     
-    # Initialize DB pool FIRST
+    logger.info("✓ Azure OpenAI environment variables validated")
+    
+    # Log database connection info
+    logger.info(f"Database config: {DB_CONFIG['user']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+    
+    
+    # Initialize DB pool - UPDATED: No arguments needed, uses DB_CONFIG internally
     try:
         await DatabasePool.initialize(
-            os.getenv("DATABASE_URL"),
             min_size=5,
             max_size=20
         )
-        logger.info("Database pool initialized")
+        logger.info("✓ Database pool initialized successfully")
     except Exception as e:
-        logger.error(f"Pool init failed: {e}")
+        logger.error(f"❌ Pool initialization failed: {e}")
         raise
     
     # Load FAISS index
     try:
+        logger.info("Loading FAISS job search index...")
         await vector_store.load_jobs_from_db()
-        logger.info("Job search index loaded")
+        logger.info("✓ Job search index loaded successfully")
     except Exception as e:
-        logger.error(f"Index load failed: {e}")
+        logger.error(f"❌ Index load failed: {e}")
         raise
     
-    logger.info("API started successfully")
+    logger.info("=== API Started Successfully ===")
     yield
     
     # Shutdown
-    logger.info("Shutting down...")
-    await DatabasePool.close()
-    embedding_executor.shutdown(wait=True)
-
-
-
-async def get_complete_job_details(
-    job_ids: List[str], 
-    location: Optional[str] = None
-) -> List[Dict]:
-    """Fetch with SQL-level type conversion"""
-    if not job_ids:
-        return []    
+    logger.info("=== API Shutting Down ===")
     try:
-        async with DatabasePool.acquire() as conn:
-            print("loc")
-            if location:
-                query = """
-                    SELECT 
-                        ncspjobid, title, keywords, description, 
-                        TO_CHAR(date, 'YYYY-MM-DD') as date,  -- Convert in SQL
-                        organizationid, organization_name, numberofopenings,
-                        industryname, sectorname, functionalareaname, 
-                        functionalrolename, aveexp, avewage, gendercode,
-                        highestqualification, statename, districtname
-                    FROM vacancies_summary
-                    WHERE ncspjobid = ANY($1::text[])
-                      AND (LOWER(statename) = LOWER($2) OR LOWER(districtname) = LOWER($2))
-                    ORDER BY ncspjobid
-                """
-                rows = await conn.fetch(query, job_ids, location)
-            else:
-                query = """
-                    SELECT 
-                        ncspjobid, title, keywords, description,
-                        TO_CHAR(date, 'YYYY-MM-DD') as date,  -- Convert in SQL
-                        organizationid, organization_name, numberofopenings,
-                        industryname, sectorname, functionalareaname,
-                        functionalrolename, aveexp, avewage, gendercode,
-                        highestqualification, statename, districtname
-                    FROM vacancies_summary
-                    WHERE ncspjobid = ANY($1::text[])
-                    ORDER BY ncspjobid
-                """
-                rows = await conn.fetch(query, job_ids)
+        await DatabasePool.close()
+        embedding_executor.shutdown(wait=True)
+        logger.info("✓ Shutdown completed successfully")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+
+
+
+# async def get_complete_job_details(
+#     job_ids: List[str], 
+#     location: Optional[str] = None
+# ) -> List[Dict]:
+#     """Fetch with SQL-level type conversion"""
+#     if not job_ids:
+#         return []    
+#     try:
+#         async with DatabasePool.acquire() as conn:
+#             print("loc")
+#             if location:
+#                 query = """
+#                     SELECT 
+#                         ncspjobid, title, keywords, description, 
+#                         TO_CHAR(date, 'YYYY-MM-DD') as date,  -- Convert in SQL
+#                         organizationid, organization_name, numberofopenings,
+#                         industryname, sectorname, functionalareaname, 
+#                         functionalrolename, aveexp, avewage, gendercode,
+#                         highestqualification, statename, districtname
+#                     FROM vacancies_summary
+#                     WHERE ncspjobid = ANY($1::text[])
+#                       AND (LOWER(statename) = LOWER($2) OR LOWER(districtname) = LOWER($2))
+#                     ORDER BY ncspjobid
+#                 """
+#                 rows = await conn.fetch(query, job_ids, location)
+#             else:
+#                 query = """
+#                     SELECT 
+#                         ncspjobid, title, keywords, description,
+#                         TO_CHAR(date, 'YYYY-MM-DD') as date,  -- Convert in SQL
+#                         organizationid, organization_name, numberofopenings,
+#                         industryname, sectorname, functionalareaname,
+#                         functionalrolename, aveexp, avewage, gendercode,
+#                         highestqualification, statename, districtname
+#                     FROM vacancies_summary
+#                     WHERE ncspjobid = ANY($1::text[])
+#                     ORDER BY ncspjobid
+#                 """
+#                 rows = await conn.fetch(query, job_ids)
             
+#             return [dict(row) for row in rows]
+            
+#     except asyncpg.PostgresError as e:
+#         logger.error(f"PostgreSQL error: {e.sqlstate} - {e}")
+#         return []
+#     except Exception as e:
+#         logger.error(f"Error fetching jobs: {e}")
+#         return []
+# app.py - UPDATE get_complete_job_details function
+
+async def get_complete_job_details(job_ids: List[str]) -> List[Dict]:
+    """Fetch complete job details from database for given job IDs"""
+    if not job_ids:
+        return []
+    
+    try:
+        # UPDATED: Use DB_CONFIG instead of DB_URL
+        conn = await asyncpg.connect(**DB_CONFIG)
+        
+        try:
+            rows = await conn.fetch("""
+                SELECT 
+                    ncspjobid, title, keywords, description,
+                    CASE WHEN date IS NOT NULL THEN TO_CHAR(date, 'YYYY-MM-DD') ELSE NULL END as date,
+                    organizationid, organization_name, numberofopenings,
+                    industryname, sectorname, functionalareaname,
+                    functionalrolename, aveexp, avewage, gendercode,
+                    highestqualification, statename, districtname
+                FROM vacancies_summary
+                WHERE ncspjobid = ANY($1::text[])
+                ORDER BY ncspjobid;
+            """, job_ids)
+            print(rows[0])
             return [dict(row) for row in rows]
             
-    except asyncpg.PostgresError as e:
-        logger.error(f"PostgreSQL error: {e.sqlstate} - {e}")
-        return []
+        finally:
+            await conn.close()
+            
     except Exception as e:
-        logger.error(f"Error fetching jobs: {e}")
+        logger.error(f"Failed to fetch job details: {e}")
         return []
 
 app = FastAPI(
