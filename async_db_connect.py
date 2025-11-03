@@ -37,6 +37,22 @@ async def fetch_tables():
         for row in rows:
             print("-", row['table_name'])
 
+        data = await conn.fetch("""
+            SELECT 
+                ncspjobid, title, keywords, description,
+                CASE WHEN date IS NOT NULL THEN TO_CHAR(date, 'YYYY-MM-DD') ELSE NULL END as date,
+                organizationid, organization_name, numberofopenings,
+                industryname, sectorname, functionalareaname,
+                functionalrolename, aveexp, avewage, gendercode,
+                highestqualification, statename, districtname
+            FROM vacancies_summary
+            WHERE ncspjobid = ANY($1::text[])
+            ORDER BY ncspjobid;
+        """, ['20V63-1550061073345J'])
+
+
+        print(data)
+
     except Exception as e:
         print("❌ Error:", e)
 
