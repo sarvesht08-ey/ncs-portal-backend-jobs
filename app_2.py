@@ -46,9 +46,6 @@ import pytesseract
 from PIL import Image
 import re
 
-
-
-
 #----------------------------------------------------
 
 # Load environment variables
@@ -60,46 +57,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-
-class DatabasePool:
-    _pool: Optional[asyncpg.Pool] = None
-    
-    @classmethod
-    async def initialize(cls, db_url: str, min_size: int = 5, max_size: int = 20):
-        """Initialize connection pool - call during startup"""
-        try:
-            cls._pool = await asyncpg.create_pool(
-                db_url,
-                min_size=min_size,
-                max_size=max_size,
-                command_timeout=60,
-                server_settings={
-                    'jit': 'off',  # Azure perf optimization
-                    'search_path': 'public'
-                }
-            )
-            logger.info(f"Database pool initialized: {min_size}-{max_size} connections")
-        except Exception as e:
-            logger.error(f"Pool initialization failed: {e}")
-            raise
-    
-    @classmethod
-    async def close(cls):
-        """Close pool - call during shutdown"""
-        if cls._pool:
-            await cls._pool.close()
-            logger.info("Database pool closed")
-    
-    @classmethod
-    @asynccontextmanager
-    async def acquire(cls):
-        """Context manager for acquiring connection"""
-        if not cls._pool:
-            raise RuntimeError("Pool not initialized")
-        
-        async with cls._pool.acquire() as conn:
-            yield conn
     
 
 def inline_sql(query: str, params: list) -> str:
@@ -457,111 +414,131 @@ class LocationJobSearchService:
                 search_context={"error": str(e)}
             )
     
-    def _build_location_query(
-        self, 
-        request: LocationJobRequest, 
-        location_matches: Dict[str, List[str]]
-    ) -> Tuple[str, List]:
-        """
-        Azure-compatible location query builder
-        
-        Issues Fixed:
-        1. ILIKE operator compatibility 
-        2. Parameterized IN clauses
-        3. Text array casting
-        """
+    def _build_location_query(self, request: LocationJobRequest, location_matches: Dict[str, List[str]]) -> Tuple[str, List]:
+        """Build SQL query for location-based search (asyncpg $1-style placeholders)."""
+
+        # Clean inputs: remove zero-width/NBSP/BOM chars that can sneak in from UI
+        def _clean(s: str) -> str:
+            return (s.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
+                    .replace('\u2060', '').replace('\ufeff', '').replace('\xa0', '').strip())
+
+        states = [_clean(x) for x in (location_matches.get("states") or [])]
+        districts = [_clean(x) for x in (location_matches.get("districts") or [])]
+
         base_query = """
-            SELECT ncspjobid, title, keywords, description, organization_name,
-                statename, districtname, industryname, sectorname,
-                functionalareaname, functionalrolename, aveexp, avewage,
-                numberofopenings, highestqualification, gendercode, date
+            SELECT ncspjobid, title, keywords, description,
+                organization_name, statename, districtname,
+                industryname, sectorname, functionalareaname, functionalrolename,
+                aveexp, avewage, numberofopenings, highestqualification,
+                gendercode, date
             FROM vacancies_summary
         """
-        
-        conditions = []
-        params = []
-        idx = 1
-        
-        # Location conditions - FIXED: Use array approach
-        if location_matches.get('states'):
-            # Build OR conditions for states
-            state_conditions = []
-            for state in location_matches['states']:
-                state_conditions.append(f"LOWER(statename) = LOWER(${idx})")
-                params.append(state)
+
+        conditions: List[str] = []
+        params: List = []
+        idx = 1  # asyncpg uses $1, $2, ...
+
+        # --- Location filters ---
+        if states:
+            conditions.append(f"statename = ANY(${idx}::text[])")
+            params.append(states)
+            idx += 1
+
+        if districts:
+            conditions.append(f"districtname = ANY(${idx}::text[])")
+            params.append(districts)
+            idx += 1
+
+        # --- Experience filter ---
+        if getattr(request, "experience_range", None):
+            min_exp, max_exp = request.experience_range
+            if min_exp is not None:
+                conditions.append(f"aveexp >= ${idx}")
+                params.append(min_exp)
                 idx += 1
-            if state_conditions:
-                conditions.append(f"({' OR '.join(state_conditions)})")
-        
-        if location_matches.get('districts'):
-            district_conditions = []
-            for district in location_matches['districts']:
-                district_conditions.append(f"LOWER(districtname) = LOWER(${idx})")
-                params.append(district)
+            if max_exp is not None:
+                conditions.append(f"aveexp <= ${idx}")
+                params.append(max_exp)
                 idx += 1
-            if district_conditions:
-                conditions.append(f"({' OR '.join(district_conditions)})")
-        
-        # Job type filter - FIXED: Avoid ILIKE on Azure
-        if request.job_type:
-            job_type_pattern = f"%{request.job_type.lower()}%"
-            conditions.append(f"""(
-                LOWER(title) LIKE ${idx} OR 
-                LOWER(keywords) LIKE ${idx} OR 
-                LOWER(functionalrolename) LIKE ${idx}
-            )""")
-            params.extend([job_type_pattern] * 3)
+
+        # --- Salary filter ---
+        if getattr(request, "salary_range", None):
+            min_salary, max_salary = request.salary_range
+            if min_salary is not None:
+                conditions.append(f"avewage >= ${idx}")
+                params.append(min_salary)
+                idx += 1
+            if max_salary is not None:
+                conditions.append(f"avewage <= ${idx}")
+                params.append(max_salary)
+                idx += 1
+
+        # --- Job type (title/keywords/role) ---
+        jt = getattr(request, "job_type", None)
+        if jt:
+            jt_like = f"%{str(jt).strip().lower()}%"
+            p1, p2, p3 = idx, idx + 1, idx + 2
+            conditions.append(
+                f"(LOWER(title) LIKE ${p1} OR LOWER(keywords) LIKE ${p2} OR LOWER(functionalrolename) LIKE ${p3})"
+            )
+            params.extend([jt_like, jt_like, jt_like])
             idx += 3
-        
+
         if conditions:
             base_query += " WHERE " + " AND ".join(conditions)
-        
+
         base_query += " ORDER BY ncspjobid DESC LIMIT 2000"
-        
-        logger.info(f"Built query with {len(params)} params")
+        logger.info("Query : %s", base_query)
         return base_query, params
  
-    async def _execute_location_query(
-        self, 
-        query: str, 
-        params: List
-    ) -> List[Dict]:
-        """Execute location query with connection pooling"""
+    async def _execute_location_query(self, query: str, params: List) -> List[Dict]:
+        """Execute the location query and return formatted results"""
+        conn = None
         try:
-            async with DatabasePool.acquire() as conn:
-                rows = await conn.fetch(query, *params)
-                
-                jobs = []
-                for row in rows:
-                    jobs.append({
-                        'ncspjobid': row['ncspjobid'],
-                        'title': row['title'],
-                        'keywords': row['keywords'],
-                        'description': row['description'],
-                        'organization_name': row['organization_name'],
-                        'statename': row['statename'],
-                        'districtname': row['districtname'],
-                        'industryname': row['industryname'],
-                        'sectorname': row['sectorname'],
-                        'functionalareaname': row['functionalareaname'],
-                        'functionalrolename': row['functionalrolename'],
-                        'aveexp': float(row['aveexp']) if row['aveexp'] else 0,
-                        'avewage': float(row['avewage']) if row['avewage'] else 0,
-                        'numberofopenings': int(row['numberofopenings']) if row['numberofopenings'] else 1,
-                        'highestqualification': row['highestqualification'],
-                        'gendercode': row['gendercode'],
-                        'date': row['date'].isoformat() if row['date'] else None,
-                        'match_percentage': 75
-                    })
-                
-                return jobs
-                
-        except asyncpg.PostgresError as e:
-            logger.error(f"Query execution failed: {e.sqlstate} - {e.message}")
-            return []
+            logger.info("SQL:\n%s", query)
+            logger.info("PARAMS: %s", params)
+            conn = await asyncpg.connect(DB_URL)
+            rows = await conn.fetch(query, *params)
+            logger.info(f"Query :{query}")
+            jobs = []
+            for row in rows:
+                job_dict = {
+                    'ncspjobid': row['ncspjobid'],
+                    'title': row['title'],
+                    'keywords': row['keywords'],
+                    'description': row['description'],
+                    'organization_name': row['organization_name'],
+                    'statename': row['statename'],
+                    'districtname': row['districtname'],
+                    'industryname': row['industryname'],
+                    'sectorname': row['sectorname'],
+                    'functionalareaname': row['functionalareaname'],
+                    'functionalrolename': row['functionalrolename'],
+                    'aveexp': float(row['aveexp']) if row['aveexp'] else 0,
+                    'avewage': float(row['avewage']) if row['avewage'] else 0,
+                    'numberofopenings': int(row['numberofopenings']) if row['numberofopenings'] else 1,
+                    'highestqualification': row['highestqualification'],
+                    'gendercode': row['gendercode'],
+                    'date': row['date'].isoformat() if row['date'] else None,
+                    'match_percentage': 75  # Default match for location-based search
+                }
+                # print(job_dict)
+                jobs.append(job_dict)
+            pretty = inline_sql(query, params)
+            print(pretty)
+            return jobs
+            
         except Exception as e:
-            logger.error(f"Unexpected query error: {e}")
+            logger.error(f"Database query execution failed: {e}")
+            try:
+                pretty = inline_sql(query, params)
+                print(pretty)
+            except Exception:
+                pretty = "<failed to inline>"
             return []
+        finally:
+            if conn:
+                await conn.close()
     
     async def _filter_by_skills(self, jobs: List[Dict], skills: List[str]) -> List[Dict]:
         """Filter jobs by skills with enhanced matching and update match percentage"""
@@ -3690,9 +3667,10 @@ cv_processor = CVProcessor(
 # FastAPI app with lifespan management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup
     logger.info("Job Search API starting up...")
     
-    # Validate env vars
+    # Validate environment variables
     required_env_vars = [
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT", 
@@ -3702,86 +3680,75 @@ async def lifespan(app: FastAPI):
     
     missing_vars = [var for var in required_env_vars if not os.getenv(var)]
     if missing_vars:
-        logger.error(f"Missing env vars: {missing_vars}")
-        raise ValueError(f"Missing: {missing_vars}")
-    
-    # Initialize DB pool FIRST
-    try:
-        await DatabasePool.initialize(
-            os.getenv("DATABASE_URL"),
-            min_size=5,
-            max_size=20
-        )
-        logger.info("Database pool initialized")
-    except Exception as e:
-        logger.error(f"Pool init failed: {e}")
-        raise
+        logger.error(f"Missing environment variables: {missing_vars}")
+        raise ValueError(f"Missing required environment variables: {missing_vars}")
     
     # Load FAISS index
     try:
         await vector_store.load_jobs_from_db()
-        logger.info("Job search index loaded")
+        logger.info("Job search index loaded successfully")
     except Exception as e:
-        logger.error(f"Index load failed: {e}")
+        logger.error(f"Failed to load job search index: {e}")
         raise
     
-    logger.info("API started successfully")
+    logger.info("Job Search API started successfully")
     yield
     
     # Shutdown
-    logger.info("Shutting down...")
-    await DatabasePool.close()
+    logger.info("Job Search API shutting down...")
     embedding_executor.shutdown(wait=True)
 
 
-
-async def get_complete_job_details(
-    job_ids: List[str], 
-    location: Optional[str] = None
-) -> List[Dict]:
-    """Fetch with SQL-level type conversion"""
+async def get_complete_job_details(job_ids: List[str]) -> List[Dict]:
+    """Fetch complete job details from database for given job IDs"""
     if not job_ids:
         return []
     
     try:
-        async with DatabasePool.acquire() as conn:
-            if location:
-                query = """
-                    SELECT 
-                        ncspjobid, title, keywords, description, 
-                        TO_CHAR(date, 'YYYY-MM-DD') as date,  -- Convert in SQL
-                        organizationid, organization_name, numberofopenings,
-                        industryname, sectorname, functionalareaname, 
-                        functionalrolename, aveexp, avewage, gendercode,
-                        highestqualification, statename, districtname
-                    FROM vacancies_summary
-                    WHERE ncspjobid = ANY($1::text[])
-                      AND (LOWER(statename) = LOWER($2) OR LOWER(districtname) = LOWER($2))
-                    ORDER BY ncspjobid
-                """
-                rows = await conn.fetch(query, job_ids, location)
-            else:
-                query = """
-                    SELECT 
-                        ncspjobid, title, keywords, description,
-                        TO_CHAR(date, 'YYYY-MM-DD') as date,  -- Convert in SQL
-                        organizationid, organization_name, numberofopenings,
-                        industryname, sectorname, functionalareaname,
-                        functionalrolename, aveexp, avewage, gendercode,
-                        highestqualification, statename, districtname
-                    FROM vacancies_summary
-                    WHERE ncspjobid = ANY($1::text[])
-                    ORDER BY ncspjobid
-                """
-                rows = await conn.fetch(query, job_ids)
+        conn = await asyncpg.connect(DB_URL)
+        try:
+            rows = await conn.fetch("""
+                SELECT ncspjobid, title, keywords, description, date, organizationid, 
+                       organization_name, numberofopenings, industryname, sectorname, 
+                       functionalareaname, functionalrolename, aveexp, avewage, 
+                       gendercode, highestqualification, statename, districtname
+                FROM vacancies_summary
+                WHERE ncspjobid = ANY($1)
+                ORDER BY ncspjobid;
+            """, job_ids)
             
-            return [dict(row) for row in rows]
+            # Convert to list of dictionaries
+            complete_jobs = []
+            for row in rows:
+                job_dict = {
+                    'ncspjobid': row['ncspjobid'],
+                    'title': row['title'],
+                    'keywords': row['keywords'],
+                    'description': row['description'],
+                    'date': row['date'].isoformat() if row['date'] else None,
+                    'organizationid': row['organizationid'],
+                    'organization_name': row['organization_name'],
+                    'numberofopenings': row['numberofopenings'],
+                    'industryname': row['industryname'],
+                    'sectorname': row['sectorname'],
+                    'functionalareaname': row['functionalareaname'],
+                    'functionalrolename': row['functionalrolename'],
+                    'aveexp': float(row['aveexp']) if row['aveexp'] else None,
+                    'avewage': float(row['avewage']) if row['avewage'] else None,
+                    'gendercode': row['gendercode'],
+                    'highestqualification': row['highestqualification'],
+                    'statename': row['statename'],
+                    'districtname': row['districtname']
+                }
+                complete_jobs.append(job_dict)
+                print(job_dict)
+            return complete_jobs
             
-    except asyncpg.PostgresError as e:
-        logger.error(f"PostgreSQL error: {e.sqlstate} - {e}")
-        return []
+        finally:
+            await conn.close()
+            
     except Exception as e:
-        logger.error(f"Error fetching jobs: {e}")
+        logger.error(f"Failed to fetch complete job details: {e}")
         return []
 
 app = FastAPI(
