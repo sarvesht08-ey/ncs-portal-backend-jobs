@@ -3819,12 +3819,13 @@ async def get_complete_job_details(job_ids: List[str]) -> List[Dict]:
         
         try:
             rows = await conn.fetch("""
-                SELECT 
+                SELECT
                     ncspjobid, title, keywords, description,
                     CASE WHEN date IS NOT NULL THEN TO_CHAR(date, 'YYYY-MM-DD') ELSE NULL END as date,
                     organizationid, organization_name, numberofopenings,
                     industryname, sectorname, functionalareaname,
-                    functionalrolename, aveexp, avewage, gendercode,
+                    functionalrolename,COALESCE(CAST(ROUND(aveexp) AS INT), 0) AS aveexp,
+                    COALESCE(ROUND(avewage::numeric, 2), 0.00) AS avewage, gendercode,
                     highestqualification, statename, districtname
                 FROM vacancies_summary
                 WHERE ncspjobid = ANY($1::text[])
